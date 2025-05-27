@@ -5,10 +5,11 @@ from cs336_basics.optimizers import AdamW
 from cs336_basics.training import cross_entropy_loss
 from cs336_systems import transformer_annotated
 import torch
-import timeit
+import timeit   
 import logging
 import pandas as pd
 import datetime
+from contextlib import nullcontext
 cs336_basics.transformer = transformer_annotated
 
 logger = logging.Logger("benchmark")
@@ -27,7 +28,7 @@ def run_simple_benchmark(d_model: int, num_heads: int, d_ff: int, context_length
                 vocab_size: int = 10000, 
                 theta: float = None,
                 dtype: torch.dtype | None = None,
-                model_size: str = None):
+                model_size: str = None, mixed_precision: bool = False):
     
     # initialize and compile model
 
@@ -64,54 +65,57 @@ def run_simple_benchmark(d_model: int, num_heads: int, d_ff: int, context_length
     full_step_times = []  
     optimizer_times = []
 
-    logger.info(f"Starting benchmarking")
-    # do not time for warmup
-    torch.cuda.synchronize()
-    for i in range(warmup_steps):
-        optimizer.zero_grad()
-        logits = model(inputs)
-        loss = loss_fn(logits, targets)
-        loss.backward()
-        optimizer.step()
-        torch.cuda.synchronize()
+    casting = torch.autocast(device_type='cuda',dtype=dtype) if mixed_precision else nullcontext()
 
-    # start profiling memory after warmup
-    torch.cuda.memory._record_memory_history(max_entries=1000000)
-
-    # time here, run on same batch of data each time without change
-    for i in range(num_steps):
-        logger.info(f"Starting timing steps")
+    with casting:
+        logger.info(f"Starting benchmarking")
+        # do not time for warmup
         torch.cuda.synchronize()
-        f_start = timeit.default_timer()
+        for i in range(warmup_steps):
+            optimizer.zero_grad()
+            logits = model(inputs)
+            loss = loss_fn(logits, targets)
+            loss.backward()
+            optimizer.step()
+            torch.cuda.synchronize()
 
-        output = model(batch)
-        torch.cuda.synchronize()
-        f_end = timeit.default_timer()
+        # start profiling memory after warmup
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
 
-        output.mean().backward()
-        torch.cuda.synchronize()
+        # time here, run on same batch of data each time without change
+        for i in range(num_steps):
+            logger.info(f"Starting timing steps")
+            torch.cuda.synchronize()
+            f_start = timeit.default_timer()
 
-        b_end = timeit.default_timer()
-        backward_pass.append(b_end - f_end)
-        forward_pass.append(f_end - f_start)
-        torch.cuda.synchronize()
+            output = model(batch)
+            torch.cuda.synchronize()
+            f_end = timeit.default_timer()
 
-        # Full training step timing with optimizer
-        torch.cuda.synchronize()
-        full_start = timeit.default_timer()
-        optimizer.zero_grad()
-        logits = model(inputs)
-        loss = loss_fn(logits, targets)
-        loss.backward()
-        optimizer.step()
-        torch.cuda.synchronize()
-        full_end = timeit.default_timer()
-        optimizer_times.append(full_end - full_start - backward_pass[-1])
-        full_step_times.append(full_end - full_start)
-        
+            output.mean().backward()
+            torch.cuda.synchronize()
 
-        torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
-        torch.cuda.memory._record_memory_history(enabled=None)
+            b_end = timeit.default_timer()
+            backward_pass.append(b_end - f_end)
+            forward_pass.append(f_end - f_start)
+            torch.cuda.synchronize()
+
+            # Full training step timing with optimizer
+            torch.cuda.synchronize()
+            full_start = timeit.default_timer()
+            optimizer.zero_grad()
+            logits = model(inputs)
+            loss = loss_fn(logits, targets)
+            loss.backward()
+            optimizer.step()
+            torch.cuda.synchronize()
+            full_end = timeit.default_timer()
+            optimizer_times.append(full_end - full_start - backward_pass[-1])
+            full_step_times.append(full_end - full_start)
+            
+
+            torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+            torch.cuda.memory._record_memory_history(enabled=None)
 
 
     # Calculate statistics
@@ -163,77 +167,76 @@ def run_simple_benchmark(d_model: int, num_heads: int, d_ff: int, context_length
         "Total Std (ms)": [(forward_std + backward_std) * 1000],
         "Full Step Mean (ms)": [full_step_mean * 1000],
         "Full Step Std (ms)": [full_step_std * 1000],
+        "Mixed Precision": [mixed_precision],
     }
     df = pd.DataFrame(results_data)
     print("\nLaTeX Table:")
     print(df.to_latex(index=False, float_format="%.2f"))
 
     logger.info("Benchmark complete.")
+    return results_data
 
-if __name__ == '__main__':
+def get_model_config(model_size):
+    if model_size == 'small':
+        return dict(d_model=768, d_ff=3072, num_layers=12, num_heads=12)
+    elif model_size == 'medium':
+        return dict(d_model=1024, d_ff=4096, num_layers=24, num_heads=16)
+    elif model_size == 'large':
+        return dict(d_model=1280, d_ff=5120, num_layers=36, num_heads=20)
+    elif model_size == 'xl':
+        return dict(d_model=1600, d_ff=6400, num_layers=48, num_heads=25)
+    elif model_size == '2.7b':
+        return dict(d_model=2560, d_ff=10240, num_layers=32, num_heads=32)
+    else:
+        raise ValueError(f"Unknown model size: {model_size}")
 
-    parser = argparse.ArgumentParser()
 
+def run_all_benchmarks():
     batch_size = 4
     vocab_size = 10000
     context_length = 256
-    d_model = 512
-    d_ff = 1344
-    n_layers = 4
-    n_heads = 16
     theta = 10000
-
-    model_size = 'medium'
-
-    if model_size == 'small':
-        d_model = 768
-        d_ff = 3072
-        num_layers = 12
-        num_heads = 12
-    elif model_size == 'medium':
-        d_model = 1024
-        d_ff = 4096
-        num_layers = 24
-        num_heads = 16
-    elif model_size == 'large':
-        d_model = 1280
-        d_ff = 5120
-        num_layers = 36
-        num_heads = 20
-    elif model_size == 'xl':
-        d_model = 1600
-        d_ff = 6400
-        num_layers = 48
-        num_heads = 25
-    elif model_size == '2.7b':
-        d_model = 2560
-        d_ff = 10240
-        num_layers = 32
-        num_heads = 32
-
     warmup_steps = 1
     num_steps = 10
-    dtype = torch.float32
+    model_sizes = ['small', 'medium', 'large', 'xl', '2.7b']
+    results = []
+    for model_size in model_sizes:
+        config = get_model_config(model_size)
+        for mixed_precision in [True, False]:
+            if mixed_precision:
+                dtype = torch.bfloat16
+            else:
+                dtype = torch.float32
+                torch.set_float32_matmul_precision('high')
+            print(f"\n[INFO] Running benchmark for {model_size} (mixed_precision={mixed_precision})")
+            results_data = run_simple_benchmark(
+                d_model=config['d_model'],
+                num_heads=config['num_heads'],
+                d_ff=config['d_ff'],
+                context_length=context_length,
+                num_layers=config['num_layers'],
+                num_steps=num_steps,
+                warmup_steps=warmup_steps,
+                batch_size=batch_size,
+                vocab_size=vocab_size,
+                theta=theta,
+                dtype=dtype,
+                model_size=model_size,
+                mixed_precision=mixed_precision
+            )
+            # Flatten results_data dict to a single row
+            row = {k: v[0] for k, v in results_data.items()}
+            results.append(row)
+    # Aggregate all results into a DataFrame and print a single LaTeX table
+    df = pd.DataFrame(results)
+    print("\nAggregated LaTeX Table:")
+    print(df.to_latex(index=False, float_format="%.2f"))
 
-    torch.set_float32_matmul_precision('high')
-
+if __name__ == '__main__':
     # Generate a unique nsys output filename using timestamp
     timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     nsys_output = f"result_{timestamp}"
     print(f"[INFO] Recommended nsys command:")
     print(f"nsys profile -o {nsys_output} python3 -m cs336_systems.benchmark")
 
-    run_simple_benchmark(
-        d_model=d_model,
-        num_heads=n_heads,
-        d_ff=d_ff,
-        context_length=context_length,
-        num_layers=n_layers,
-        num_steps=num_steps,
-        warmup_steps=warmup_steps,
-        batch_size=batch_size,
-        vocab_size=vocab_size,
-        theta=theta,
-        dtype=dtype,
-        model_size=model_size
-    )
+    run_all_benchmarks()

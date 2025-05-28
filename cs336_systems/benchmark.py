@@ -11,6 +11,7 @@ import pandas as pd
 import datetime
 from contextlib import nullcontext
 cs336_basics.transformer = transformer_annotated
+import torch
 
 logger = logging.Logger("benchmark")
 
@@ -240,8 +241,6 @@ def run_benchmark_suite():
 
 
 def profile_2_7b_memory_by_context_length():
-    import torch
-    import pandas as pd
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     batch_size = 4
     vocab_size = 10000
@@ -320,8 +319,6 @@ def profile_2_7b_memory_by_context_length():
     print(df.to_latex(index=False, float_format="%.2f"))
 
 def profile_2_7b_memory_forward_and_fullstep():
-    import torch
-    import pandas as pd
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     batch_size = 4
     vocab_size = 10000
@@ -380,8 +377,81 @@ def profile_2_7b_memory_forward_and_fullstep():
     torch.cuda.memory._record_memory_history(enabled=None)
     print(f"[INFO] Full training step memory profile saved to memory_ctx128_fullstep.pickle")
 
+def profile_all_models_memory_forward_and_fullstep():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    batch_size = 4
+    vocab_size = 10000
+    context_length = 128
+    theta = 10000
+    model_sizes = ['small', 'medium', 'large', 'xl', '2.7b']
+    
+    for model_size in model_sizes:
+        print(f"\n[INFO] Profiling {model_size} model...")
+        config = get_model_config(model_size)
+        
+        # Model setup
+        model = TransformerLM(
+            d_model=config['d_model'],
+            d_ff=config['d_ff'],
+            vocab_size=vocab_size,
+            context_length=context_length,
+            num_heads=config['num_heads'],
+            num_layers=config['num_layers'],
+            theta=theta,
+            device=device,
+            dtype=torch.float32
+        )
+        model = torch.compile(model)
+        model.to(device)
+        
+        optimizer = AdamW(
+            model.parameters(),
+            lr=1e-4,
+            weight_decay=0.01,
+            eps=1e-8,
+            betas=(0.9, 0.95)
+        )
+        loss_fn = cross_entropy_loss
+        
+        # Generate random batch
+        batch = torch.randint(low=0, high=vocab_size, size=(batch_size, context_length), device=device)
+        inputs = batch
+        targets = batch
+        
+        # Forward pass only
+        print(f"[INFO] Profiling forward pass only for {model_size}...")
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        
+        with torch.autocast(device_type='cuda', dtype=torch.float32):
+            logits = model(inputs)
+        torch.cuda.synchronize()
+        
+        torch.cuda.memory._dump_snapshot(f"memory_{model_size}_forward.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
+        print(f"[INFO] Forward pass memory profile saved to memory_{model_size}_forward.pickle")
+        
+        # Full training step
+        print(f"[INFO] Profiling full training step for {model_size}...")
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        
+        with torch.autocast(device_type='cuda', dtype=torch.float32):
+            optimizer.zero_grad()
+            logits = model(inputs)
+            loss = loss_fn(logits, targets)
+            loss.backward()
+            optimizer.step()
+        torch.cuda.synchronize()
+        
+        torch.cuda.memory._dump_snapshot(f"memory_{model_size}_fullstep.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
+        print(f"[INFO] Full training step memory profile saved to memory_{model_size}_fullstep.pickle")
+
 if __name__ == '__main__':
     # run_benchmark_suite()
-    # To run the memory profiling, call profile_2_7b_memory_by_context_length() here if desired
-    #profile_2_7b_memory_by_context_length()
-    profile_2_7b_memory_forward_and_fullstep()
+    # profile_2_7b_memory_by_context_length()
+    # profile_2_7b_memory_forward_and_fullstep()
+    profile_all_models_memory_forward_and_fullstep()

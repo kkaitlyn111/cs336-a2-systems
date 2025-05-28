@@ -116,8 +116,6 @@ def run_simple_benchmark(d_model: int, num_heads: int, d_ff: int, context_length
 
             torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
             torch.cuda.memory._record_memory_history(enabled=None)
-
-
     # Calculate statistics
     forward_mean = sum(forward_pass) / len(forward_pass)
     forward_std = (sum((x - forward_mean) ** 2 for x in forward_pass) / len(forward_pass)) ** 0.5
@@ -232,11 +230,158 @@ def run_all_benchmarks():
     print("\nAggregated LaTeX Table:")
     print(df.to_latex(index=False, float_format="%.2f"))
 
-if __name__ == '__main__':
+def run_benchmark_suite():
     # Generate a unique nsys output filename using timestamp
     timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     nsys_output = f"result_{timestamp}"
     print(f"[INFO] Recommended nsys command:")
     print(f"nsys profile -o {nsys_output} python3 -m cs336_systems.benchmark")
-
     run_all_benchmarks()
+
+
+def profile_2_7b_memory_by_context_length():
+    import torch
+    import pandas as pd
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    batch_size = 4
+    vocab_size = 10000
+    theta = 10000
+    d_model = 2560
+    d_ff = 10240
+    num_layers = 32
+    num_heads = 32
+    model_size = '2.7b'
+    dtype = torch.bfloat16
+    results = []
+    for context_length in [128, 256, 512]:
+        print(f"\n[INFO] Starting memory profiling for context length {context_length}...")
+        # Model setup
+        model = TransformerLM(
+            d_model=d_model, d_ff=d_ff, vocab_size=vocab_size,
+            context_length=context_length, num_heads=num_heads, num_layers=num_layers,
+            theta=theta, device=device, dtype=dtype
+        )
+        model = torch.compile(model)
+        model.to(device)
+        optimizer = AdamW(
+            model.parameters(),
+            lr=1e-4, weight_decay=0.01, eps=1e-8, betas=(0.9, 0.95)
+        )
+        loss_fn = cross_entropy_loss
+        batch = torch.randint(low=0, high=vocab_size, size=(batch_size, context_length), device=device)
+        inputs = batch
+        targets = batch
+        # Start memory history recording for all phases
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
+        # Forward pass memory
+        print(f"[INFO]   Forward pass...")
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        with torch.autocast(device_type='cuda', dtype=dtype):
+            logits = model(inputs)
+        torch.cuda.synchronize()
+        forward_mem = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        # Backward pass memory
+        print(f"[INFO]   Backward pass...")
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        with torch.autocast(device_type='cuda', dtype=dtype):
+            logits = model(inputs)
+            loss = loss_fn(logits, targets)
+            loss.backward()
+        torch.cuda.synchronize()
+        backward_mem = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        # Optimizer step memory
+        print(f"[INFO]   Optimizer step...")
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        with torch.autocast(device_type='cuda', dtype=dtype):
+            optimizer.zero_grad()
+            logits = model(inputs)
+            loss = loss_fn(logits, targets)
+            loss.backward()
+            optimizer.step()
+        torch.cuda.synchronize()
+        optimizer_mem = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        # Dump memory history for this context length
+        torch.cuda.memory._dump_snapshot(f"memory_ctx{context_length}.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
+        print(f"[INFO] Finished memory profiling for context length {context_length}.")
+        results.append({
+            'Context Length': context_length,
+            'Forward Peak Memory (MB)': forward_mem,
+            'Backward Peak Memory (MB)': backward_mem,
+            'Optimizer Step Peak Memory (MB)': optimizer_mem
+        })
+    df = pd.DataFrame(results)
+    print("\n2.7B Model Memory Profiling by Context Length:")
+    print(df.to_string(index=False, float_format="%.2f"))
+    print("\nLaTeX Table:")
+    print(df.to_latex(index=False, float_format="%.2f"))
+
+def profile_2_7b_memory_forward_and_fullstep():
+    import torch
+    import pandas as pd
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    batch_size = 4
+    vocab_size = 10000
+    theta = 10000
+    d_model = 2560
+    d_ff = 10240
+    num_layers = 32
+    num_heads = 32
+    model_size = '2.7b'
+    dtype = torch.bfloat16
+    context_length = 128
+    mixed_precision = False
+    dtype = torch.float32
+    torch.set_float32_matmul_precision('high')
+    # Model setup
+    print(f"[INFO] Setting up model for context length {context_length}...")
+    model = TransformerLM(
+        d_model=d_model, d_ff=d_ff, vocab_size=vocab_size,
+        context_length=context_length, num_heads=num_heads, num_layers=num_layers,
+        theta=theta, device=device, dtype=dtype
+    )
+    model = torch.compile(model)
+    model.to(device)
+    optimizer = AdamW(
+        model.parameters(),
+        lr=1e-4, weight_decay=0.01, eps=1e-8, betas=(0.9, 0.95)
+    )
+    loss_fn = cross_entropy_loss
+    batch = torch.randint(low=0, high=vocab_size, size=(batch_size, context_length), device=device)
+    inputs = batch
+    targets = batch
+    # Forward pass only
+    print(f"[INFO] Profiling forward pass only...")
+    torch.cuda.memory._record_memory_history(max_entries=1000000)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    with torch.autocast(device_type='cuda', dtype=dtype):
+        logits = model(inputs)
+    torch.cuda.synchronize()
+    torch.cuda.memory._dump_snapshot("memory_ctx128_forward.pickle")
+    torch.cuda.memory._record_memory_history(enabled=None)
+    print(f"[INFO] Forward pass memory profile saved to memory_ctx128_forward.pickle")
+    # Full training step (zero_grad, forward, backward, optimizer step)
+    print(f"[INFO] Profiling full training step...")
+    torch.cuda.memory._record_memory_history(max_entries=1000000)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    with torch.autocast(device_type='cuda', dtype=dtype):
+        optimizer.zero_grad()
+        logits = model(inputs)
+        loss = loss_fn(logits, targets)
+        loss.backward()
+        optimizer.step()
+    torch.cuda.synchronize()
+    torch.cuda.memory._dump_snapshot("memory_ctx128_fullstep.pickle")
+    torch.cuda.memory._record_memory_history(enabled=None)
+    print(f"[INFO] Full training step memory profile saved to memory_ctx128_fullstep.pickle")
+
+if __name__ == '__main__':
+    # run_benchmark_suite()
+    # To run the memory profiling, call profile_2_7b_memory_by_context_length() here if desired
+    #profile_2_7b_memory_by_context_length()
+    profile_2_7b_memory_forward_and_fullstep()

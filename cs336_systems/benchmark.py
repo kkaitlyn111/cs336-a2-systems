@@ -12,6 +12,7 @@ import datetime
 from contextlib import nullcontext
 cs336_basics.transformer = transformer_annotated
 import torch
+import os
 
 logger = logging.Logger("benchmark")
 
@@ -41,21 +42,21 @@ def run_simple_benchmark(d_model: int, num_heads: int, d_ff: int, context_length
     #model = torch.compile(model)
     model.to(device)
 
-    # Add optimizer and loss function (custom, matching your usual setup)
+   
     optimizer = AdamW(
         model.parameters(),
-        lr=1e-4,  # You can adjust this or make it an argument
+        lr=1e-4, 
         weight_decay=0.01,
         eps=1e-8,
         betas=(0.9, 0.95)
     )
-    loss_fn = cross_entropy_loss  # Use as a function, not instantiated
+    loss_fn = cross_entropy_loss  
 
     # generate random batch of data
     batch = torch.randint(low=0, high=vocab_size, size=(batch_size, context_length))
     batch = batch.to(device)
 
-    # Prepare inputs and targets for language modeling
+ 
     inputs = batch
     targets = batch
 
@@ -116,7 +117,7 @@ def run_simple_benchmark(d_model: int, num_heads: int, d_ff: int, context_length
 
     torch.cuda.memory._dump_snapshot(f"memory_ctx{context_length}.pickle")
     torch.cuda.memory._record_memory_history(enabled=None)
-    # Calculate statistics
+    # calculate statistics
     forward_mean = sum(forward_pass) / len(forward_pass)
     forward_std = (sum((x - forward_mean) ** 2 for x in forward_pass) / len(forward_pass)) ** 0.5
     backward_mean = sum(backward_pass) / len(backward_pass)
@@ -175,7 +176,6 @@ def run_simple_benchmark(d_model: int, num_heads: int, d_ff: int, context_length
     # return results_data
 
 def run_memory_foward_fullstep(d_model: int, num_heads: int, d_ff: int, context_length: int, num_layers: int, 
-                num_steps, warmup_steps,
                 batch_size: int = 4,
                 vocab_size: int = 10000, 
                 theta: float = None,
@@ -210,19 +210,23 @@ def run_memory_foward_fullstep(d_model: int, num_heads: int, d_ff: int, context_
 
     casting = torch.autocast(device_type='cuda',dtype=dtype) if mixed_precision else nullcontext()
 
+
     with casting:
         logger.info(f"Starting benchmarking memory for {context_length} context length")
-      
         torch.cuda.memory._record_memory_history(max_entries=1000000)
 
 
         if forward_only:
             logger.info(f"Starting timing forward pass only")
+            torch.cuda.reset_peak_memory_stats(device)
+            torch.cuda.empty_cache()
             torch.cuda.synchronize()
             logits = model(inputs)
             torch.cuda.synchronize()
         else:
         # Full training step timing with optimizer
+            torch.cuda.reset_peak_memory_stats(device)
+            torch.cuda.empty_cache()
             torch.cuda.synchronize()
             optimizer.zero_grad()
             logits = model(inputs)
@@ -230,9 +234,18 @@ def run_memory_foward_fullstep(d_model: int, num_heads: int, d_ff: int, context_
             loss.backward()
             optimizer.step()
             torch.cuda.synchronize()
+    
+    peak_memory = torch.cuda.max_memory_allocated(device) / (1024 ** 2)  # Convert bytes to MB
 
-    torch.cuda.memory._dump_snapshot(f"memory_ctx{context_length}_{'forward' if forward_only else 'fullstep'}.pickle")
+    memory_dir = "memory_files"
+    filename = f"memory_ctx{context_length}_{'forward' if forward_only else 'fullstep'}_{'mixed' if mixed_precision else ''}.pickle"
+    full_path = os.path.join(memory_dir, filename)
+
+    torch.cuda.memory._dump_snapshot(full_path)
+    logger.info(f"File saved to {full_path}")
     torch.cuda.memory._record_memory_history(enabled=None)
+
+    return peak_memory
 
 def get_model_config(model_size):
     if model_size == 'small':
@@ -304,33 +317,40 @@ def profile_memory_forward_fullstep():
     theta = 10000
     device = torch.device('cuda')
 
-    context_lengths = [128, 256, 512, 1024]
+    context_lengths = [128, 256, 512]
     model_sizes = ['2.7b']
 
-    mixed_precision = False
+    mixed_precision = True
     if mixed_precision:
         dtype = torch.bfloat16
     else:
         dtype = torch.float32
         torch.set_float32_matmul_precision('high')
 
-    for model_size in model_sizes:
-        for context_length in context_lengths:
-            print(f"\n[INFO] Starting memory profiling for context length {context_length}...")
-            config = get_model_config(model_size)
-            run_memory_foward_fullstep(
-                d_model=config['d_model'],
-                num_heads=config['num_heads'],
-                d_ff=config['d_ff'],
-                context_length=context_length,
-                num_layers=config['num_layers'],
-                batch_size=batch_size,
-                vocab_size=vocab_size,
-                theta=theta,
-                dtype=dtype,
-                model_size=model_size,
-                mixed_precision=mixed_precision
-            )
+    rows = []
+    for forward_only in [True, False]:
+        for model_size in model_sizes:
+            for context_length in context_lengths:
+                print(f"\n[INFO] Starting memory profiling for context length {context_length} with mixed precision {mixed_precision}...")
+                config = get_model_config(model_size)
+                peak_memory = run_memory_foward_fullstep(
+                    d_model=config['d_model'],
+                    num_heads=config['num_heads'],
+                    d_ff=config['d_ff'],
+                    context_length=context_length,
+                    num_layers=config['num_layers'],
+                    batch_size=batch_size,
+                    vocab_size=vocab_size,
+                    theta=theta,
+                    dtype=dtype,
+                    model_size=model_size,
+                    mixed_precision=mixed_precision,
+                    forward_only=forward_only
+                )
+                rows.append({'context length': context_length, 'forward only': forward_only, 'peak memory (MB)': peak_memory})
+
+    df = pd.DataFrame(rows)
+    print(df.to_latex(index=False, float_format="%.2f"))
 
 def profile_2_7b_memory_by_context_length():
     batch_size = 4

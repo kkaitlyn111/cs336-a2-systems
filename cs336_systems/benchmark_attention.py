@@ -77,7 +77,7 @@ def run_attention_benchmark():
 
     rows = []
 
-    for compile in [False]:
+    for compile in [True, False]:
         for d_model in d_models:
             for seq_len in seq_lens:
                 try:

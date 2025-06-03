@@ -30,7 +30,7 @@ def run_simple_benchmark(d_model: int, num_heads: int, d_ff: int, context_length
                 vocab_size: int = 10000, 
                 theta: float = None,
                 dtype: torch.dtype | None = None,
-                model_size: str = None, mixed_precision: bool = False):
+                model_size: str = None, mixed_precision: bool = False, compile: bool = False):
     
     # initialize and do not compile model
 
@@ -39,9 +39,10 @@ def run_simple_benchmark(d_model: int, num_heads: int, d_ff: int, context_length
     model = TransformerLM(d_model = d_model, d_ff = d_ff, vocab_size = vocab_size, 
                           context_length = context_length, num_heads = num_heads, num_layers = num_layers, 
                           theta = theta, device = device, dtype = dtype)
-    #model = torch.compile(model)
+    
+    if compile:
+        model = torch.compile(model)
     model.to(device)
-
    
     optimizer = AdamW(
         model.parameters(),
@@ -127,18 +128,18 @@ def run_simple_benchmark(d_model: int, num_heads: int, d_ff: int, context_length
 
     # Print model settings
     print("\nModel Settings:")
-    print(f"Device: {device}")
-    print(f"Model Architecture:")
+    # # print(f"Device: {device}")
+    # print(f"Model Architecture:")
     print(f"  model size: {model_size}")
-    print(f"  d_model: {d_model}")
-    print(f"  num_heads: {num_heads}")
-    print(f"  d_ff: {d_ff}")
+    # print(f"  d_model: {d_model}")
+    # print(f"  num_heads: {num_heads}")
+    # print(f"  d_ff: {d_ff}")
     print(f"  context_length: {context_length}")
-    print(f"  num_layers: {num_layers}")
-    print(f"  vocab_size: {vocab_size}")
-    print(f"  batch_size: {batch_size}")
+    # print(f"  num_layers: {num_layers}")
+    # print(f"  vocab_size: {vocab_size}")
+    # print(f"  batch_size: {batch_size}")
     print(f"  dtype: {dtype}")
-    print(f"  theta: {theta}")
+    # print(f"  theta: {theta}")
     
     # print("\nBenchmark Results:")
     # print(f"Forward Pass:")
@@ -155,25 +156,21 @@ def run_simple_benchmark(d_model: int, num_heads: int, d_ff: int, context_length
     # print(f"  Std:  {full_step_std*1000:.2f} ms")
 
     # # Prepare data for LaTeX table
-    # results_data = {
-    #     "Model Size": [model_size],
-    #     "context_length": [context_length],
-    #     "Forward Mean (ms)": [forward_mean * 1000],
-    #     "Forward Std (ms)": [forward_std * 1000],
-    #     "Backward Mean (ms)": [backward_mean * 1000],
-    #     "Backward Std (ms)": [backward_std * 1000],
-    #     "Total Mean (ms)": [(forward_mean + backward_mean) * 1000],
-    #     "Total Std (ms)": [(forward_std + backward_std) * 1000],
-    #     "Full Step Mean (ms)": [full_step_mean * 1000],
-    #     "Full Step Std (ms)": [full_step_std * 1000],
-    #     "Mixed Precision": [mixed_precision],
-    # }
-    # df = pd.DataFrame(results_data)
-    # print("\nLaTeX Table:")
-    # print(df.to_latex(index=False, float_format="%.2f"))
+    results_data = {
+        "model size": [model_size],
+        "context length": [context_length],
+        "forward mean (ms)": [forward_mean * 1000],
+        "forward std (ms)": [forward_std * 1000],
+        "full step mean (ms)": [full_step_mean * 1000],
+        "full step std (ms)": [full_step_std * 1000],
+        "compiled?": [compile],
+    }
+    df = pd.DataFrame(results_data)
+    print("\nLaTeX Table:")
+    print(df.to_latex(index=False, float_format="%.2f"))
 
     logger.info("Benchmark complete.")
-    # return results_data
+    return results_data
 
 def run_memory_foward_fullstep(d_model: int, num_heads: int, d_ff: int, context_length: int, num_layers: int, 
                 batch_size: int = 4,
@@ -267,19 +264,22 @@ def run_all_benchmarks():
     vocab_size = 10000
     context_length = 256
     theta = 10000
-    warmup_steps = 1
+    warmup_steps = 2
     num_steps = 10
     model_sizes = ['small', 'medium', 'large', 'xl', '2.7b']
+    mixed_precision = False
     results = []
+    
+    if mixed_precision:
+        dtype = torch.bfloat16
+    else:
+        dtype = torch.float32
+        torch.set_float32_matmul_precision('high')
+
     for model_size in model_sizes:
         config = get_model_config(model_size)
-        for mixed_precision in [True, False]:
-            if mixed_precision:
-                dtype = torch.bfloat16
-            else:
-                dtype = torch.float32
-                torch.set_float32_matmul_precision('high')
-            print(f"\n[INFO] Running benchmark for {model_size} (mixed_precision={mixed_precision})")
+        for compile in [True, False]:
+            print(f"\n[INFO] Running benchmark for {model_size} compile={compile})")
             results_data = run_simple_benchmark(
                 d_model=config['d_model'],
                 num_heads=config['num_heads'],
@@ -450,4 +450,5 @@ if __name__ == '__main__':
     # run_benchmark_suite()
     # profile_2_7b_memory_by_context_length()
     # profile_2_7b_memory_forward_and_fullstep()
-    profile_memory_forward_fullstep()
+    # profile_memory_forward_fullstep()
+    run_all_benchmarks()

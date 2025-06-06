@@ -2,6 +2,7 @@ import torch
 from einops import rearrange
 import numpy as np
 from einops import einsum
+import triton as t1    
 
 class FlashAttentionTorch(torch.autograd.Function):
     @staticmethod
@@ -46,11 +47,12 @@ class FlashAttentionTorch(torch.autograd.Function):
                 Vj = V[j]
 
                 Sij = einsum(Qi, Kj, "batch Bq d, batch Bk d -> batch Bq Bk") / np.sqrt(d)
-                rowmax = torch.max(Sij, dim=2, keepdim=True)
-                Mij = torch.max(Mi_prev, rowmax.squeeze(-1))
-                Pij = torch.exp(Sij - Mij)
-                rowsum_Pij = torch.sum(Pij, dim=2, keepdim=True)
-                Lij = torch.exp(Mi_prev - Mij) * Li_prev + rowsum_Pij
+                rowmax = torch.max(Sij, dim=2, keepdim=False)[0]
+                Mij = torch.maximum(Mi_prev, rowmax)
+                Pij = torch.exp(Sij - Mij.unsqueeze(-1))
+                rowsum_Pij = torch.sum(Pij, dim=2, keepdim=False)
+
+                Lij = (torch.exp(Mi_prev - Mij) * Li_prev) + rowsum_Pij
                 
                 # formula: diag(exp(Mi[j-1] - Mi[j])) * Oi[j-1] + Pij * Vj
                 diag_scale = torch.diag_embed(torch.exp(Mi_prev - Mij))  # [batch, Bq, Bq]
@@ -70,10 +72,13 @@ class FlashAttentionTorch(torch.autograd.Function):
         
         context.save_for_backward(Q, K, V, O, L)
         
-        return O, L
+        return O
 
     @staticmethod
     def backward(context, dO):
         print(f"dO: {dO.shape}")
         return dO, None, None, None
     
+# class FlashAttentionTriton(torch.autograd.Function):
+#     @staticmethod
+#     def forward(context, Q, K, V, is_causal = False):

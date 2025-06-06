@@ -6,6 +6,7 @@ import numpy as np
 from jaxtyping import Float, Int
 import numpy.typing as npt
 from torch import Tensor, LongTensor
+from cs336_basics.transformer import softmax
 
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, num_heads: int, d_ff: int, 
@@ -166,19 +167,19 @@ class MultiheadSelfAttention(nn.Module):
 @nvtx.range("scaled dot product attention")
 def scaled_dot_product_attention(Q: Float[Tensor, " ... queries d_k"], K: Float[Tensor, " ... keys d_k"], V: Float[Tensor, " ... values d_v"], mask: Float[Tensor, " ... queries keys"] | None = None,) -> Float[Tensor, " ... queries d_v"]:
     d_k = Q.shape[-1]
-    with ntvx.range("attention scores"):
-        attention_scores = torch.einsum("...qd,...kd->...qk", Q, K)
-        attention_scores = attention_scores / np.sqrt(d_k)
 
-    with ntvx.range("masking"):
-        if mask is not None:
-            attention_scores = attention_scores.masked_fill(mask == False, -1e9)
+    attention_scores = torch.einsum("...qd,...kd->...qk", Q, K)
+    attention_scores = attention_scores / np.sqrt(d_k)
+
+
+    if mask is not None:
+        attention_scores = attention_scores.masked_fill(mask == False, -1e9)
     
-    with ntvx.range("softmax"):
-        attention_weights = softmax(attention_scores, dim=-1)
+
+    attention_weights = softmax(attention_scores, dim=-1)
     
-    with ntvx.range("weighted sum"):
-        output = torch.einsum("...qk,...kd->...qd", attention_weights, V)
+
+    output = torch.einsum("...qk,...kd->...qd", attention_weights, V)
     
     return output
 

@@ -17,6 +17,7 @@ class FlashAttentionTorch(torch.autograd.Function):
         # now [batch, sequence_length, d]
 
         d = Q.shape[-1]
+        device = Q.device
 
         # assume divisible, all powers of 2
         Q = rearrange(Q, "batch (Tq Bq) d -> Tq batch Bq d", Bq = Bq) # [Tq, batch, Bq, d]
@@ -29,16 +30,16 @@ class FlashAttentionTorch(torch.autograd.Function):
 
         batch = Q.shape[1]
 
-        O = torch.zeros(Tq, batch, Bq, d)
-        L = torch.zeros(Tq, batch, Bq)
-        Mi = torch.full((batch, Bq), float('-inf'))
+        O = torch.zeros(Tq, batch, Bq, d, device=device)
+        L = torch.zeros(Tq, batch, Bq, device=device)
+        Mi = torch.full((batch, Bq), float('-inf'), device=device)
 
         for i in range(Tq):
             Qi = Q[i]
 
-            Oi_prev = torch.zeros(batch, Bq, d)
-            Li_prev = torch.zeros(batch, Bq)
-            Mi_prev = torch.full((batch, Bq), float('-inf'))
+            Oi_prev = torch.zeros(batch, Bq, d, device=device)
+            Li_prev = torch.zeros(batch, Bq, device=device)
+            Mi_prev = torch.full((batch, Bq), float('-inf'), device=device)
 
             for j in range(Tk):
                 Kj = K[j]
@@ -67,14 +68,18 @@ class FlashAttentionTorch(torch.autograd.Function):
         
         O = rearrange(O, 'Tq batch Bq d -> batch (Tq Bq) d')
         L = rearrange(L, 'Tq batch Bq -> batch (Tq Bq)')
+        Q = rearrange(Q, 'Tq batch Bq d -> batch (Tq Bq) d')
+        K = rearrange(K, 'Tk batch Bk d -> batch (Tk Bk) d')
+        V = rearrange(V, 'Tk batch Bk d -> batch (Tk Bk) d')
         
         context.save_for_backward(Q, K, V, O, L)
-        
+        context.is_causal = is_causal
         return O
 
     @staticmethod
-    def backward(context, dO, is_causal = False):
-        Q, K, V, O, L = context.saved_tensors
+    def backward(context, dO):
+        Q, K, V, O, L = context.saved_tensors  
+        is_causal = context.is_causal
         return compiled_backward(Q, K, V, O, L, dO, is_causal)
     
 class FlashAttentionTriton(torch.autograd.Function):
@@ -116,14 +121,16 @@ class FlashAttentionTriton(torch.autograd.Function):
             L.stride(0), L.stride(1),
             N_QUERIES=N_QUERIES, N_KEYS=N_KEYS,
             scale=scale,
-            D=d, Q_TILE_SIZE=Bq, K_TILE_SIZE=Bk)
+            D=d, Q_TILE_SIZE=Bq, K_TILE_SIZE=Bk, is_causal=is_causal)
 
         context.save_for_backward(Q, K, V, O, L)
+        context.is_causal = is_causal
         return O
     
     @staticmethod
-    def backward(context, dO, is_causal = False):
+    def backward(context, dO):
         Q, K, V, O, L = context.saved_tensors
+        is_causal = context.is_causal
         return compiled_backward(Q, K, V, O, L, dO, is_causal)
 
 
@@ -140,7 +147,8 @@ def flash_attention_kernel(
     scale, # 1 / sqrt(d)
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
-    K_TILE_SIZE: tl.constexpr,):
+    K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr):
 
     query_tile_index = tl.program_id(0)
     # n_query_tiles = N_QUERIES // Q_TILE_SIZE
@@ -220,6 +228,12 @@ def flash_attention_kernel(
 
         Sij = tl.dot(Q, tl.trans(Kj)) * scale
 
+        if is_causal:
+            query_offsets = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+            key_offsets = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+            mask = query_offsets[:, None] < key_offsets[None, :]
+            Sij = tl.where(mask, float('-inf'), Sij)
+
         sij_max = tl.max(Sij, axis=1)
         mij = tl.maximum(mi_prev, sij_max)
         pij = tl.exp(Sij - mij[:, None])
@@ -261,13 +275,16 @@ def backward_pass_recomp(Q, K, V, O, L, dO, is_causal = False):
     S = einsum(Q, K, "... Nq d, ... Nk d -> ... Nq Nk") / np.sqrt(d)
     if is_causal:
         S = S.masked_fill(mask, float('-inf'))
-    P = torch.exp(S - L[..., None])
+    if L.shape != S.shape[:-1]:
+        # Try to reshape L to match S's batch dims
+        L = L.view(*S.shape[:-1])
+    P = torch.exp(S - L.unsqueeze(-1))
     dV = einsum(P, dO, "... Nq Nk, ... Nq d -> ... Nk d")
     dP = einsum(dO, V, "... Nq d, ... Nk d -> ... Nq Nk")
     dS = P * (dP - D[..., None])
     dQ = einsum(dS, K, "... Nq Nk, ... Nk d -> ... Nq d") / np.sqrt(d)
     dK = einsum(dS, Q, "... Nq Nk, ... Nq d -> ... Nk d") / np.sqrt(d)
-    return dQ, dK, dV
+    return dQ, dK, dV, None
     
 compiled_backward = torch.compile(backward_pass_recomp)
  

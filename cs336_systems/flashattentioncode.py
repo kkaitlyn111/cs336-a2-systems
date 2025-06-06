@@ -1,5 +1,3 @@
-  
-
 import torch
 import numpy as np
 import einops
@@ -11,10 +9,7 @@ from flash_attention import FlashAttentionTorch as FA_Triton
 from flash_attention import compiled_backward as flash_bkwd_compiled
 from flash_attention import backward_pass_recomp as flash_bkwd
 from flash_attention import FlashAttentionTorch as FA_Pytorch
-from cs336_basics.transformer import attention
-from cs336_basics.transformer import TransformerLM
-from cs336_basics.transformer import scaled_dot_product_attention as attention
-
+from cs336_systems.transformer_annotated import scaled_dot_product_attention as attention
 
 
 def benchmark_FA(context_length, d, dtype):
@@ -38,9 +33,9 @@ def benchmark_FA(context_length, d, dtype):
         mask = torch.triu(torch.ones(context_length, context_length, device=device, dtype=torch.bool), diagonal=1) if is_causal else None
         attention(Q, K, V, mask)
     def backward_triton():
-        flash_bkwd_compiled(Q, K, V, dO, O, L, is_causal)
+        flash_bkwd_compiled(Q, K, V, O, L, dO, is_causal)
     def backward_pytorch():
-        flash_bkwd(Q, K, V, dO, O, L, is_causal)
+        flash_bkwd(Q, K, V, O, L, dO, is_causal)
     def fb_triton():
         O = FA_Triton.apply(Q, K, V, is_causal)
         loss = torch.mean(O)
@@ -144,6 +139,11 @@ def create_flash_attention_benchmark_table(benchmark_results, units="ms"):
     
     print(f"\n---------- Flash Attention Benchmark Results ----------")
     print(df.to_string(col_space=15))
+
+    # Save as LaTeX
+    latex_str = df.to_latex('flash_attention_benchmarks.tex')
+    print("\nLaTeX table output:\n")
+    print(latex_str)
     return df
 
 # ---------------------------------------------------------------------------

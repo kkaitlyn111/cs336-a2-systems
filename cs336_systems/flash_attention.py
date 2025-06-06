@@ -10,7 +10,6 @@ class FlashAttentionTorch(torch.autograd.Function):
     def forward(context, Q, K, V, is_causal = False):
         Bq = 16
         Bk = 16
-
         if len(Q.shape) == 2: Q = Q.unsqueeze(0)
         if len(K.shape) == 2: K = K.unsqueeze(0)
         if len(V.shape) == 2: V = V.unsqueeze(0)    
@@ -255,21 +254,20 @@ def flash_attention_kernel(
      
 
 def backward_pass_recomp(Q, K, V, O, L, dO, is_causal = False):
-    D = torch.sum(O * dO, dim = -1)
-    d = Q.shape[-1]
-    S  = torch.einsum("b t d, b s d -> b t s", Q, K) / np.sqrt(d)
+    Nq, Nk, d = Q.shape[-2], K.shape[-2], Q.shape[-1]
     if is_causal:
-        upper_triangular_mask = torch.triu(torch.ones(S.shape, device=S.device), diagonal=1).to(torch.bool)
-        S = S.masked_fill(upper_triangular_mask, float('-inf'))
-
-    Pij = torch.exp(S - L[:, :, None])
-    dV = torch.einsum("b t s, b t d -> b s d", Pij, dO)
-    dP = torch.einsum("b t d, b s d -> b t s", dO, V)
-    dS = Pij * (dP - D[:, :, None])
-    dQ = torch.einsum("b t s, b s d -> b t d", dS, K) / np.sqrt(d)
-    dK = torch.einsum("b t s, b t d -> b s d", dS, Q) / np.sqrt(d)
-
-    return dQ, dK, dV, None
+        mask = torch.triu(torch.ones(Nq, Nk, device=Q.device, dtype=torch.bool), diagonal=1)
+    D = torch.sum(O * dO, dim=-1)
+    S = einsum(Q, K, "... Nq d, ... Nk d -> ... Nq Nk") / np.sqrt(d)
+    if is_causal:
+        S = S.masked_fill(mask, float('-inf'))
+    P = torch.exp(S - L[..., None])
+    dV = einsum(P, dO, "... Nq Nk, ... Nq d -> ... Nk d")
+    dP = einsum(dO, V, "... Nq d, ... Nk d -> ... Nq Nk")
+    dS = P * (dP - D[..., None])
+    dQ = einsum(dS, K, "... Nq Nk, ... Nk d -> ... Nq d") / np.sqrt(d)
+    dK = einsum(dS, Q, "... Nq Nk, ... Nq d -> ... Nk d") / np.sqrt(d)
+    return dQ, dK, dV
     
 compiled_backward = torch.compile(backward_pass_recomp)
  

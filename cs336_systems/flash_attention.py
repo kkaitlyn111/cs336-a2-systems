@@ -13,7 +13,7 @@ class FlashAttentionTorch(torch.autograd.Function):
 
         if len(Q.shape) == 2: Q = Q.unsqueeze(0)
         if len(K.shape) == 2: K = K.unsqueeze(0)
-        if len(V.shape) == 2: V = V.unsqueeze(0)
+        if len(V.shape) == 2: V = V.unsqueeze(0)    
 
         # now [batch, sequence_length, d]
 
@@ -74,9 +74,9 @@ class FlashAttentionTorch(torch.autograd.Function):
         return O
 
     @staticmethod
-    def backward(context, dO):
-        print(f"dO: {dO.shape}")
-        return dO, None, None, None
+    def backward(context, dO, is_causal = False):
+        Q, K, V, O, L = context.saved_tensors
+        return compiled_backward(Q, K, V, O, L, dO, is_causal)
     
 class FlashAttentionTriton(torch.autograd.Function):
     @staticmethod
@@ -123,9 +123,9 @@ class FlashAttentionTriton(torch.autograd.Function):
         return O
     
     @staticmethod
-    def backward(context, dO):
-        print(f"dO: {dO.shape}")
-        return dO, None, None, None
+    def backward(context, dO, is_causal = False):
+        Q, K, V, O, L = context.saved_tensors
+        return compiled_backward(Q, K, V, O, L, dO, is_causal)
 
 
 @triton.jit
@@ -146,7 +146,6 @@ def flash_attention_kernel(
     query_tile_index = tl.program_id(0)
     # n_query_tiles = N_QUERIES // Q_TILE_SIZE
     batch_index = tl.program_id(1)
-    key_tile_index = tl.program_id(2)
 
     Q_block_ptr = tl.make_block_ptr(Q_ptr + batch_index * stride_qb,
                                     shape = (N_QUERIES, D),
@@ -157,14 +156,14 @@ def flash_attention_kernel(
     K_block_ptr = tl.make_block_ptr(K_ptr + batch_index * stride_kb,
                                     shape = (N_KEYS, D),
                                     strides = (stride_kk, stride_kd),
-                                    offsets = (key_tile_index * K_TILE_SIZE, 0),
+                                    offsets = (0, 0),
                                     block_shape = (K_TILE_SIZE, D),
                                     order = (1, 0),)
 
     V_block_ptr = tl.make_block_ptr(V_ptr + batch_index * stride_vb,
                                     shape = (N_KEYS, D),
                                     strides = (stride_vk, stride_vd),
-                                    offsets = (key_tile_index * K_TILE_SIZE, 0),
+                                    offsets = (0, 0),
                                     block_shape = (K_TILE_SIZE, D),
                                     order = (1, 0),)
     
@@ -182,15 +181,15 @@ def flash_attention_kernel(
                                     block_shape = (Q_TILE_SIZE,),
                                     order = (0,))
 
-    Q = tl.load(Q_block_ptr)
+    Q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
     Tk = tl.cdiv(N_KEYS, K_TILE_SIZE)
 
     oi_prev = tl.zeros((Q_TILE_SIZE,D), dtype=tl.float32)
     mi_prev = tl.full((Q_TILE_SIZE,), float('-inf'), dtype=tl.float32)
     li_prev = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
 
-    Sij = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE), dtype=tl.float32)
-    rowmax = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
+    # Sij = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE), dtype=tl.float32)
+    # rowmax = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
 
     # for j in range(Tk):
     #     Kj = tl.load(K_block_ptr)
@@ -217,8 +216,8 @@ def flash_attention_kernel(
     #     li_prev = lij
 
     for j in range(Tk):
-        Kj = tl.load(K_block_ptr)
-        Vj = tl.load(V_block_ptr)
+        Kj = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        Vj = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
 
         Sij = tl.dot(Q, tl.trans(Kj)) * scale
 
@@ -250,13 +249,30 @@ def flash_attention_kernel(
     oi = oi.to(O_block_ptr.type.element_ty)
     li = li.to(L_block_ptr.type.element_ty)
 
-    tl.store(O_block_ptr, oi)
-    tl.store(L_block_ptr, li)
+    tl.store(O_block_ptr, oi, boundary_check=(0, 1))
+    tl.store(L_block_ptr, li, boundary_check=(0,))
     
      
 
+def backward_pass_recomp(Q, K, V, O, L, dO, is_causal = False):
+    D = torch.sum(O * dO, dim = -1)
+    d = Q.shape[-1]
+    S  = torch.einsum("b t d, b s d -> b t s", Q, K) / np.sqrt(d)
+    if is_causal:
+        upper_triangular_mask = torch.triu(torch.ones(S.shape, device=S.device), diagonal=1).to(torch.bool)
+        S = S.masked_fill(upper_triangular_mask, float('-inf'))
 
+    Pij = torch.exp(S - L[:, :, None])
+    dV = torch.einsum("b t s, b t d -> b s d", Pij, dO)
+    dP = torch.einsum("b t d, b s d -> b t s", dO, V)
+    dS = Pij * (dP - D[:, :, None])
+    dQ = torch.einsum("b t s, b s d -> b t d", dS, K) / np.sqrt(d)
+    dK = torch.einsum("b t s, b t d -> b s d", dS, Q) / np.sqrt(d)
 
+    return dQ, dK, dV, None
+    
+compiled_backward = torch.compile(backward_pass_recomp)
+ 
 
     
 

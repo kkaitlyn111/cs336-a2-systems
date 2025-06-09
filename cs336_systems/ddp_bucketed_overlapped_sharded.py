@@ -10,8 +10,8 @@ import os
 import timeit
 import pickle
 from cs336_basics.transformer import Transformer
-from cs336_basics.cross_entropy import cross_entropy
-from cs336_basics.adamw import AdamW
+from cs336_basics.training import cross_entropy_loss as cross_entropy
+from cs336_basics.optimizers import AdamW
 import argparse
 import collections
 from typing import Any, Type, Optional, Callable

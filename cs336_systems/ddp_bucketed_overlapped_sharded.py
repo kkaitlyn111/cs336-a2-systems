@@ -9,7 +9,7 @@ import torch.cuda.nvtx as nvtx
 import os
 import timeit
 import pickle
-from cs336_basics.transformer import Transformer
+from cs336_basics.transformer import TransformerLM
 from cs336_basics.training import cross_entropy_loss as cross_entropy
 from cs336_basics.optimizers import AdamW
 import argparse
@@ -21,7 +21,7 @@ def train_single_process(hparams):
     d_model, d_ff, num_layers, num_heads, batch_size, theta, context_length, vocab_size, lr, betas, eps, weight_decay, num_steps = hparams["d_model"], hparams["d_ff"], hparams["num_layers"], hparams["num_heads"], hparams["batch_size"], hparams["theta"], hparams["context_length"], hparams["vocab_size"], hparams["lr"], hparams["betas"], hparams["eps"], hparams["weight_decay"], hparams["num_steps"]
     
     device = torch.device("cuda")
-    model = Transformer(vocab_size=vocab_size, context_length=context_length, d_model=d_model, num_layers=num_layers, num_heads=num_heads, d_ff=d_ff, theta=theta, device=device, dtype=torch.float32).to(device)
+    model = TransformerLM(vocab_size=vocab_size, context_length=context_length, d_model=d_model, num_layers=num_layers, num_heads=num_heads, d_ff=d_ff, theta=theta, device=device, dtype=torch.float32).to(device)
     
     optimizer = AdamW(model.parameters(), lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
     with open("data_large.pkl", "rb") as f:
@@ -54,7 +54,7 @@ def train_process(rank, world_size, hparams):
         device = torch.device(f"cuda:{rank}")
         d_model, d_ff, num_layers, num_heads, batch_size, theta, context_length, vocab_size, lr, betas, eps, weight_decay, num_steps = hparams["d_model"], hparams["d_ff"], hparams["num_layers"], hparams["num_heads"], hparams["batch_size"], hparams["theta"], hparams["context_length"], hparams["vocab_size"], hparams["lr"], hparams["betas"], hparams["eps"], hparams["weight_decay"], hparams["num_steps"]
 
-        model = Transformer(vocab_size=vocab_size, context_length=context_length, d_model=d_model, num_layers=num_layers, num_heads=num_heads, d_ff=d_ff, theta=theta, device=device, dtype=torch.float32).to(device)
+        model = TransformerLM(vocab_size=vocab_size, context_length=context_length, d_model=d_model, num_layers=num_layers, num_heads=num_heads, d_ff=d_ff, theta=theta, device=device, dtype=torch.float32).to(device)
         for param in model.parameters():
             dist.broadcast(param.data, src=0)
         optimizer = AdamW(model.parameters(), lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
@@ -134,7 +134,7 @@ def train_process_ddp(rank, world_size, hparams, wrap, sharded=False):
         device = torch.device(f"cuda:{rank}")
         d_model, d_ff, num_layers, num_heads, batch_size, theta, context_length, vocab_size, lr, betas, eps, weight_decay, num_steps = hparams["d_model"], hparams["d_ff"], hparams["num_layers"], hparams["num_heads"], hparams["batch_size"], hparams["theta"], hparams["context_length"], hparams["vocab_size"], hparams["lr"], hparams["betas"], hparams["eps"], hparams["weight_decay"], hparams["num_steps"]
 
-        model = Transformer(vocab_size=vocab_size, context_length=context_length, d_model=d_model, num_layers=num_layers, num_heads=num_heads, d_ff=d_ff, theta=theta, device=device, dtype=torch.float32).to(device)
+        model = TransformerLM(vocab_size=vocab_size, context_length=context_length, d_model=d_model, num_layers=num_layers, num_heads=num_heads, d_ff=d_ff, theta=theta, device=device, dtype=torch.float32).to(device)
         if wrap == "DDP":
             model_ddp = DDP(model)
         elif wrap == "DDP_Bucketed":
